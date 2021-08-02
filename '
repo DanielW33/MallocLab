@@ -1,0 +1,507 @@
+/*
+ * mm.c
+ *
+ * Name(s): [Vid Govindappa, Daniel Williams]
+ *
+ * Crediting Ideas Taken from (https://danluu.com/malloc-tutorial/) no code copied, just general concepts
+ *
+ * Checkpoint 1: Solution Overview | Due: 2/28/21 | Submitted 2/27/21  
+ * - Implemented Linked list like structure to put at the beginning of each data segment (struct metaData)
+ * - Implemented Malloc: Meta data offset is 8 + 8 more bytes for alignment by 16
+ * - Implemented Helper function getmetaData(void* ptr) to get ptr - offset     
+ * - Implemented free: free's a block 
+ * - Implemented realloc: Checks if block has space to be reallocated with size
+ * TODO: Improve efficientcy by implementing helper function FindFreeBlocks to see if a block is set to free X
+ * TODO: Improve efficientcy by implemeting FindFreeBlocks into malloc X
+ * TODO: Improve efficientcy by modifying realloc to subdivide blocks X
+ *
+ * Checkpoint 2: Solution Overview | Due 3/9/21 | Submitted 3/9/21
+ * - Implemented "Cache" to improve throughput
+ * - Implemented helper function Find_Free_Blocks to realloc free space and improve util
+ * - Current Configuration achieves score of 59/100
+ * TODO: Redesign structure for checkpoint 3.
+ * TODO: Reduce the amount of meta data space allocated
+ * TODO: Current amount of space required for Metadata is 16 bytes per allocation.
+ * IDEA: Add 1 to ptr if block is free, then it will no longer align to 16
+ *
+ */
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "mm.h"
+#include "memlib.h"
+
+/*
+ * If you want to enable your debugging output and heap checker code,
+ * uncomment the following line. Be sure not to have debugging enabled
+ * in your final submission.
+ */
+// #define DEBUG
+
+#ifdef DEBUG
+/* When debugging is enabled, the underlying functions get called */
+#define dbg_printf(...) printf(__VA_ARGS__)
+#define dbg_assert(...) assert(__VA_ARGS__)
+#else
+/* When debugging is disabled, no code gets generated */
+#define dbg_printf(...)
+#define dbg_assert(...)
+#endif /* DEBUG */
+
+/* do not change the following! */
+#ifdef DRIVER
+/* create aliases for driver tests */
+#define malloc mm_malloc
+#define free mm_free
+#define realloc mm_realloc
+#define calloc mm_calloc
+#define memset mem_memset
+#define memcpy mem_memcpy
+#endif /* DRIVER */
+
+/* What is the correct alignment? */
+#define ALIGNMENT 16
+
+/* rounds up to the nearest multiple of ALIGNMENT */
+
+static size_t align(size_t x)
+{
+    return ALIGNMENT * ((x+ALIGNMENT-1)/ALIGNMENT);
+}
+/*
+ * MetaData Structure to hold block information
+*/ 
+typedef struct {
+  void* next;       //8
+  size_t Free;      //8 was size_t
+}meta;
+
+typedef struct {
+  void* ptr;       //8
+} Cache;
+/*
+* Global Variables
+*/
+void* BaseAddr = NULL; //8
+void* Start = NULL;    //8
+int FreedBlocks;       //8
+int Fails;             //8 
+                       //56 Total
+/*
+ * Function Prototypes
+*/ 
+void Clear_Cache();
+void Combine_Adjacent(void*);
+void* Concatenate_Blocks(size_t);
+/*
+ * mm_init function initializes the heap, and basic global information 
+*/
+bool mm_init(void)
+{
+  BaseAddr = mem_sbrk(0);
+  Clear_Cache();
+  if(mem_sbrk(800) == NULL) return false;
+  FreedBlocks = 0;
+  Fails = 0;
+  return true;
+}
+/*
+ * Begin "Cache" Functions here
+ *    We use this "Cache" to temporarily contain the locations of the Free Blocks in the linked list
+ *    This is different than the explicit free list because it is stored on the heap. As of right now, this cache is 800bytes or 100 pointer locations
+ *
+ *    This "Cache" Counts the number of cache misses or "Fails", after a certain number of fails, the cache will clear, this is just to improve throughput of the program
+ *    Depending on the fails parameter the util is in the range of 40.# - 52.#     
+*/ 
+/*
+ * Contains_Null() searches for the first empty spot in the cache
+ */
+bool Contains_Null(){
+  Cache* C = BaseAddr;
+  for(int i = 0; i < 100; i++){
+    if(C->ptr == NULL) return true;
+    C = ((void*)C) + 8;
+  }
+
+  return false;
+}
+void Remove_ptr(void* ptr){
+  Cache* C = BaseAddr;
+
+  for(int i = 0; i < 100; i++){
+    if(C->ptr == ptr){
+      C->ptr = NULL;
+      break;
+     }
+    C = ((void*)C) + 8;
+  }
+}
+/*
+ * Set_Cache(void* ptr) sets the first available NULL location in cache to ptr
+*/ 
+void Set_Cache(void* ptr){
+  Combine_Adjacent(ptr);
+  
+  Cache* C = BaseAddr;
+  
+  for(int i = 0; i < 100; i++){
+    if(C->ptr == NULL){
+      C->ptr = ptr;
+      break;
+    }
+    C = ((void*)C) + 8;
+  }
+}
+/*
+ * Get_Cache(size_t size) searches for a ptr with size size
+*/
+void* Get_Cache(size_t size){
+  Cache* C = BaseAddr;
+  for(int i = 0; i < 100; i++){
+    
+    if(C->ptr != NULL){
+      
+      void* T = C->ptr;
+      size_t blksize = ((meta*)T)->next - T;
+      
+      if(blksize >= size){
+        Remove_ptr(C->ptr);
+        C->ptr = NULL;
+        return T;
+      }
+    }
+    C = ((void*)C) + 8;
+  }
+  Fails ++;
+  return NULL;
+}
+/*
+ * Clear_Cache() removes all ptrs from the cache
+*/
+void Clear_Cache(){
+  Cache* C = BaseAddr;
+  for(int i = 0; i < 100; i++){
+    C->ptr = NULL; 
+    C = BaseAddr + (8 * (i+1));
+  }
+}
+/*
+ * Count_Null() returns the number of Null ptrs in cache
+*/
+int Count_Null(){
+  Cache* C = BaseAddr;
+  int Counter = 0;
+  for(int i = 0; i < 100; i++){
+    if(C->ptr == NULL){
+      Counter++;
+    }
+    C = ((void*)C) + 8;
+  }
+  return Counter;
+}
+/*
+ * End Cache Functions
+*/
+
+void* Concatenate_Blocks(size_t size){
+  meta* ptr = NULL;
+  void* End = mem_sbrk(0);
+  
+  bool Exists = true;
+  void* Selected = NULL;
+
+  while(Exists){
+    Exists = false;
+    ptr = Start;
+    Selected = NULL;
+   
+    while(((void*)ptr) != End){
+      meta* Next = ((meta*)ptr->next);
+      
+      if(((void*)Next) == End){
+        break;
+      }
+
+      if(ptr->Free == 1 && Next->Free == 1){
+        ptr->next = Next->next;
+        //Exists = true;
+        Remove_ptr(((void*)Next));
+         
+      }
+      if(ptr->Free == 1){
+        size_t blksize = ptr->next - ((void*)ptr);
+        if(blksize >= size && Selected == NULL){
+          return ((void*)ptr);          
+        }
+      }
+      ptr = ((meta*)ptr->next);
+    }
+  }
+  if(Selected == NULL) return mem_sbrk(0);
+  else{
+    Remove_ptr(Selected);
+    return Selected;
+  }
+} 
+
+void Combine_Adjacent(void* ptr){
+  meta* T = ((meta*)ptr);
+  if(T->next != mem_sbrk(0) && ptr != mem_sbrk(0)){
+    meta* next = ((meta*)T->next);
+    if(T->Free == 1 && next->Free == 1){ 
+      T->next = next->next;
+      Remove_ptr(((void*)next));
+    }
+  } 
+}
+/*
+ * Locate_Free_Block function to find the first available free block, or return end.
+*/
+void* Locate_Free_Block(size_t size){
+  if(FreedBlocks == 0) return mem_sbrk(0);
+  
+  void* C = Get_Cache(size);
+
+  if(C != NULL && mem_sbrk(0)) return C;
+  
+  if(Contains_Null()) return mem_sbrk(0);  
+ // if(Fails >= 100){
+   // Clear_Cache(); 
+  //if(Fails >= 30){
+  //  Clear_Cache();
+  //  Fails = 0;
+ // }
+   C = Concatenate_Blocks(size);
+   if(C != NULL) return C;
+   printf("This should never run.\n");
+   // Fails = 0;
+ // }
+   
+ /* void* End = mem_sbrk(0);                  //If Cache is full and a free block has not been found, search for a available free block. Else return End of heap 
+  meta* Block = Start;
+  size_t blksize;
+  
+  while(((void*) Block) != End){
+    blksize = Block->next - ((void*)Block);
+    
+    if(blksize >= size && Block->Free == 1 ){
+      FreedBlocks --;
+      Remove_ptr(((void*)Block)); 
+      return ((void*)Block);
+    }
+     
+    Block = ((meta*)Block->next);
+  }
+  return End;*/
+   return mem_sbrk(0);
+}
+
+/*
+ * malloc
+*/
+void* malloc(size_t size){ 
+
+  if(size == 0 ){
+    return NULL;
+  }
+  else{
+
+    size_t var = size + 16; //16;
+   
+    while(var % 16 != 0){              //While Loop to ensure alignment of 16
+      var++;
+    }
+
+    if(Start == NULL){                 //Setting Start address only runs one time
+      Start = mem_sbrk(0);
+      
+      void* TempBlock = mem_sbrk(var); //Allocating var bytes of memory
+
+      meta* Block = TempBlock;         //Casting to type struct metaData*
+
+      void* next = mem_sbrk(0);
+      int Free = 0;
+
+      Block->next = next;
+      Block->Free = Free; 
+              
+      void* Final = TempBlock + 16;    //Returning address of Data only.  
+      
+      return Final;
+      
+    }
+    else{
+      void* FoundBlock = Locate_Free_Block(var); //Searches for free block before allocating more space 
+     
+      if(FoundBlock == mem_sbrk(0)){             //Creating new block
+        void* Temp = mem_sbrk(var);
+            
+        meta* Block = Temp;
+      
+        Block->next = mem_sbrk(0);
+        Block->Free = 0;    
+      
+        void* Final = ((void*)Block) + 16;
+
+        return Final;
+     }
+      else{
+        void* Temp = FoundBlock;                //Reusing a available block 
+        meta* Block = Temp;
+     
+        if(Temp + var == Block->next){ 
+          Block->Free = 0;
+        }
+        else{                                   //Reusing available block and subdividing it
+          void* T = Temp + var;
+
+          meta* NewBlock = ((meta*)(T));
+          NewBlock->next = Block->next;
+          NewBlock->Free = 1;
+          
+          Block->next = ((void*)NewBlock);
+          Block->Free = 0;
+          FreedBlocks ++;
+          Set_Cache(T);
+        }
+        void* Final = Temp + 16;
+        
+        return Final;
+
+      } 
+    }  
+ }
+ return NULL;
+}
+
+
+ /*
+ * free
+ */
+
+void free(void* ptr)
+{
+  if(ptr != NULL){
+    void* T = (ptr - 16); 
+    meta* block = ((meta*)T);  //Setting Block to free  
+    block->Free = 1;
+    FreedBlocks++;
+    Set_Cache(T);
+  }
+  return;
+}
+
+/*
+ * realloc
+*/
+void* realloc(void* oldptr, size_t size)
+{
+  if(oldptr== NULL || oldptr == mem_sbrk(0)){ //If Null ptr or at the end of the heap, allocate more memory
+    return malloc(size);
+  }
+  if(size == 0){  //If size is 0 free block
+    free(oldptr);
+  }
+  else{
+    void* T = (oldptr - 16);
+    meta* Block = ((meta*)T);
+    size_t blksize = Block->next - (((void*)Block));
+    
+    if(blksize >= size + 16){ //if block size can hold size + offset
+      size_t var = size+ 16;
+      
+      while(var % 16 != 0){
+        var++;
+      }
+      
+      size_t Remainder = blksize - (blksize - (var));
+      
+      if(Remainder > 16 && Block->next - Remainder < ((void*)Block)){ //Reallocating block and subdividing it
+        meta* NewBlock = (Block->next - Remainder);
+        NewBlock->next = Block->next;
+        NewBlock->Free = 1;
+        Block->next = NewBlock;
+        FreedBlocks ++;
+        Set_Cache(((void*)NewBlock));
+      }
+      return oldptr;
+    }
+
+    void* ptr = malloc(size);   //Else allocate more memory, copy data from oldptr
+    
+    memcpy(ptr, oldptr, blksize);
+    free(oldptr);
+    
+    return ptr;
+  } 
+   
+   return NULL;
+}
+
+/*
+ * calloc
+ * This function is not tested by mdriver, and has been implemented for you.
+ */
+void* calloc(size_t nmemb, size_t size)
+{
+    void* ptr;
+    size *= nmemb;
+    ptr = malloc(size);
+    if (ptr) {
+        memset(ptr, 0, size);
+    }
+    return ptr;
+}
+
+/*
+ * Returns whether the pointer is in the heap.
+ * May be useful for debugging.
+ */
+static bool in_heap(const void* p)
+{
+    return p <= mem_heap_hi() && p >= mem_heap_lo();
+}
+
+/*
+ * Returns whether the pointer is aligned.
+ * May be useful for debugging.
+ */
+static bool aligned(const void* p)
+{
+    size_t ip = (size_t) p;
+    return align(ip) == ip;
+}
+
+/*
+ * mm_checkheap
+ */
+bool mm_checkheap(int lineno)
+{
+  void* End = mem_sbrk(0);
+  meta* Block = ((meta*)Start);
+  int Free = 0; int Total = 0;
+  while(((void*)Block) != End){
+    if(Block->Free == 1){
+      Free ++;
+    }
+    Total++;
+    Block = Block->next;
+  }
+  float ratio = ((float)(Free / Total));
+  printf("Free: %d | Total: %d | Ratio: %f\n",Free,Total,ratio); 
+#ifdef DEBUG
+ // printf("Free Blocks: %d | Total Blocks: %d | 
+    /* Write code to check heap invariants here */
+    /* IMPLEMENT THIS */
+#endif /* DEBUG */
+    return true;
+}
+
+
+
+
